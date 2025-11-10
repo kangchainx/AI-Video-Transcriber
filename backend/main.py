@@ -110,6 +110,13 @@ active_tasks = {}
 # 存储SSE连接，用于实时推送状态更新
 sse_connections = {}
 
+EXPORT_FORMATS = {
+    "markdown": ("md", "text/markdown"),
+    "txt": ("txt", "text/plain"),
+    "docx": ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    "pdf": ("pdf", "application/pdf")
+}
+
 def _load_text_from_file(path: Path) -> Optional[str]:
     """读取UTF-8文本文件，若失败返回None。"""
     try:
@@ -182,6 +189,26 @@ def _prepare_export_text(
         processed = _compact_blank_lines(processed)
     return processed
 
+def _export_buffer_by_format(format_key: str, content: str):
+    fmt = format_key.lower()
+    if fmt == "markdown":
+        return exporter.export_markdown(content)
+    if fmt == "txt":
+        return exporter.export_text(content)
+    if fmt == "docx":
+        return exporter.export_docx(content)
+    if fmt == "pdf":
+        return exporter.export_pdf(content)
+    raise ValueError(f"Unsupported export format: {format_key}")
+
+def _generate_unique_filename(base_name: str, extension: str) -> str:
+    candidate = f"{base_name}.{extension}"
+    counter = 1
+    while (TEMP_DIR / candidate).exists():
+        candidate = f"{base_name}_{counter}.{extension}"
+        counter += 1
+    return candidate
+
 def _sanitize_title_for_filename(title: str) -> str:
     """将视频标题清洗为安全的文件名片段，尽可能保留原始字符。"""
     if not title:
@@ -207,7 +234,10 @@ async def read_root():
 @app.post("/api/process-video")
 async def process_video(
     url: str = Form(...),
-    summary_language: str = Form(default="zh")
+    summary_language: str = Form(default="zh"),
+    export_format: str = Form(default="markdown"),
+    export_include_timestamps: bool = Form(default=False),
+    export_include_header: bool = Form(default=False)
 ):
     """
     处理视频链接，返回任务ID
@@ -234,12 +264,26 @@ async def process_video(
             "script": None,
             "summary": None,
             "error": None,
-            "url": url  # 保存URL用于去重
+            "url": url,  # 保存URL用于去重
+            "default_export_filename": None,
+            "default_export_format": None,
+            "default_export_include_timestamps": export_include_timestamps,
+            "default_export_include_header": export_include_header,
+            "default_export_request_format": export_format
         }
         save_tasks(tasks)
         
         # 创建并跟踪异步任务
-        task = asyncio.create_task(process_video_task(task_id, url, summary_language))
+        task = asyncio.create_task(process_video_task(
+            task_id,
+            url,
+            summary_language,
+            {
+                "format": export_format.lower(),
+                "include_timestamps": export_include_timestamps,
+                "include_header": export_include_header
+            }
+        ))
         active_tasks[task_id] = task
         
         return {"task_id": task_id, "message": "任务已创建，正在处理中..."}
@@ -248,7 +292,7 @@ async def process_video(
         logger.error(f"处理视频时出错: {str(e)}")
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
 
-async def process_video_task(task_id: str, url: str, summary_language: str):
+async def process_video_task(task_id: str, url: str, summary_language: str, export_options: dict):
     """
     异步处理视频任务
     """
@@ -395,6 +439,31 @@ async def process_video_task(task_id: str, url: str, summary_language: str):
             await f.write(summary_with_source)
         
         # 更新状态：完成
+        default_export_filename = None
+        default_export_format = None
+        if export_options:
+            fmt_key = export_options.get("format", "markdown").lower()
+            if fmt_key not in EXPORT_FORMATS:
+                fmt_key = "markdown"
+            if fmt_key in EXPORT_FORMATS:
+                try:
+                    prepared_text = _prepare_export_text(
+                        script_with_title,
+                        keep_timestamps=export_options.get("include_timestamps", False),
+                        compact_blank=True,
+                        strip_metadata=not export_options.get("include_header", False)
+                    )
+                    buffer = _export_buffer_by_format(fmt_key, prepared_text)
+                    base_name_for_file = _sanitize_title_for_filename(video_title)
+                    filename = _generate_unique_filename(base_name_for_file, EXPORT_FORMATS[fmt_key][0])
+                    full_path = TEMP_DIR / filename
+                    with open(full_path, "wb") as f:
+                        f.write(buffer.getvalue())
+                    default_export_filename = filename
+                    default_export_format = fmt_key
+                except Exception as e:
+                    logger.error(f"默认导出文件生成失败: {e}")
+
         task_result = {
             "status": "completed",
             "progress": 100,
@@ -407,7 +476,11 @@ async def process_video_task(task_id: str, url: str, summary_language: str):
             "short_id": short_id,
             "safe_title": safe_title,
             "detected_language": detected_language,
-            "summary_language": summary_language
+            "summary_language": summary_language,
+            "default_export_filename": default_export_filename,
+            "default_export_format": default_export_format,
+            "default_export_include_timestamps": export_options.get("include_timestamps", False) if export_options else False,
+            "default_export_include_header": export_options.get("include_header", False) if export_options else False
         }
         
         # 如果有翻译，添加翻译信息
@@ -547,13 +620,7 @@ async def export_content(
     if content_type not in allowed_types:
         raise HTTPException(status_code=400, detail="不支持的内容类型")
 
-    allowed_formats = {
-        "markdown": ("md", "text/markdown"),
-        "txt": ("txt", "text/plain"),
-        "docx": ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-        "pdf": ("pdf", "application/pdf")
-    }
-    if export_format not in allowed_formats:
+    if export_format not in EXPORT_FORMATS:
         raise HTTPException(status_code=400, detail="不支持的导出格式")
 
     if include_timestamps and content_type != "transcript":
@@ -609,21 +676,14 @@ async def export_content(
         strip_metadata=strip_metadata
     )
 
-    ext, media_type = allowed_formats[export_format]
+    ext, media_type = EXPORT_FORMATS[export_format]
     if content_type == "transcript":
         final_name = base_name
     else:
         final_name = f"{base_name}_{content_type}"
     filename = f"{final_name}.{ext}"
 
-    if export_format == "markdown":
-        buffer = exporter.export_markdown(content)
-    elif export_format == "txt":
-        buffer = exporter.export_text(content)
-    elif export_format == "docx":
-        buffer = exporter.export_docx(content)
-    else:
-        buffer = exporter.export_pdf(content)
+    buffer = _export_buffer_by_format(export_format, content)
 
     headers = _build_download_headers(filename)
     return StreamingResponse(buffer, media_type=media_type, headers=headers)
@@ -634,9 +694,11 @@ async def download_file(filename: str):
     直接从temp目录下载文件（简化方案）
     """
     try:
-        # 检查文件扩展名安全性
-        if not filename.endswith('.md'):
-            raise HTTPException(status_code=400, detail="仅支持下载.md文件")
+        allowed_exts = {f".{ext}" for ext, _ in EXPORT_FORMATS.values()}
+        allowed_exts.add(".md")
+        file_suffix = Path(filename).suffix.lower()
+        if file_suffix not in allowed_exts:
+            raise HTTPException(status_code=400, detail="文件类型不被允许")
         
         # 检查文件名格式（防止路径遍历攻击）
         if '..' in filename or '/' in filename or '\\' in filename:
