@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -7,25 +8,43 @@ import tempfile
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 import aiofiles
 from urllib.parse import quote
 import uuid
 import json
 import re
 import unicodedata
+import mimetypes
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency handled via requirements
+    load_dotenv = None
 
 from video_processor import VideoProcessor
 from transcriber import Transcriber
 from summarizer import Summarizer
 from translator import Translator
 from exporter import Exporter
+from storage import MinioStorage
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI视频转录器", version="1.0.0")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body()
+    logger.error("[ValidationError] path=%s errors=%s body=%s headers=%s",
+                 request.url.path,
+                 exc.errors(),
+                 body.decode(errors="ignore"),
+                 dict(request.headers))
+    raise exc
 
 # CORS中间件配置
 app.add_middleware(
@@ -40,6 +59,11 @@ app.add_middleware(
 # 获取项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent
 
+if load_dotenv:
+    load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
+else:
+    logger.warning("python-dotenv未安装，.env变量不会自动加载")
+
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "static")), name="static")
 
@@ -47,12 +71,24 @@ app.mount("/static", StaticFiles(directory=str(PROJECT_ROOT / "static")), name="
 TEMP_DIR = PROJECT_ROOT / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 
+CLEAN_TEMP_FILES = os.getenv("CLEAN_TEMP_FILES", "false").lower() == "true"
+
 # 初始化处理器
 video_processor = VideoProcessor()
 transcriber = Transcriber()
 summarizer = Summarizer()
 translator = Translator()
 exporter = Exporter(PROJECT_ROOT)
+try:
+    minio_storage = MinioStorage.from_env()
+except Exception as exc:
+    logger.error(f"初始化MinIO失败: {exc}")
+    minio_storage = MinioStorage(None, None)
+else:
+    if not minio_storage.enabled:
+        logger.warning("[MinIO] 功能未启用（缺少配置或依赖）")
+    else:
+        logger.info("[MinIO] 上传功能已启用")
 
 # 存储任务状态 - 使用文件持久化
 import json
@@ -117,6 +153,51 @@ EXPORT_FORMATS = {
     "pdf": ("pdf", "application/pdf")
 }
 
+
+def _compose_object_name(prefix: str, filename: str, *, task_id: Optional[str] = None) -> str:
+    parts = []
+    if prefix:
+        parts.append(prefix.strip("/"))
+    if task_id:
+        parts.append(task_id.replace("/", ""))
+    if filename:
+        parts.append(filename.lstrip("/"))
+    return "/".join(parts)
+
+
+async def _upload_to_minio(local_path: Path, object_name: str, *, required: bool = False) -> Optional[str]:
+    if not minio_storage or not minio_storage.enabled:
+        logger.debug("[MinIO] 跳过上传（未配置） path=%s object=%s", local_path, object_name)
+        if required:
+            raise RuntimeError("MinIO未配置，无法上传必需文件")
+        return None
+    try:
+        return await minio_storage.upload_file(local_path, object_name)
+    except Exception as exc:
+        logger.error(f"上传文件到MinIO失败: {exc}")
+        if required:
+            raise
+        return None
+
+
+def _delete_local_file(path: Optional[Union[Path, str]], *, force: bool = False) -> None:
+    if not path:
+        return
+    try:
+        target = Path(path)
+    except TypeError:
+        return
+    if target.name == "tasks.json":
+        return
+    if not force and not CLEAN_TEMP_FILES:
+        return
+    try:
+        if target.exists():
+            target.unlink()
+            logger.info(f"已删除本地缓存文件: {target}")
+    except Exception as exc:
+        logger.warning(f"删除本地文件失败 {path}: {exc}")
+
 def _load_text_from_file(path: Path) -> Optional[str]:
     """读取UTF-8文本文件，若失败返回None。"""
     try:
@@ -132,6 +213,168 @@ def _build_download_headers(filename: str) -> dict:
     encoded = quote(filename)
     header_value = f"attachment; filename*=UTF-8''{encoded}"
     return {"Content-Disposition": header_value}
+
+
+def _format_from_filename(filename: Optional[str]) -> Optional[str]:
+    if not filename:
+        return None
+    ext = Path(filename).suffix.lstrip(".").lower()
+    if not ext:
+        return None
+    for fmt_key, (fmt_ext, _) in EXPORT_FORMATS.items():
+        if fmt_ext == ext:
+            return fmt_key
+    return ext
+
+
+def _media_type_for_format(fmt: Optional[str]) -> Optional[str]:
+    if not fmt:
+        return None
+    mapping = EXPORT_FORMATS.get(fmt.lower())
+    if mapping:
+        return mapping[1]
+    return mimetypes.guess_type(f"file.{fmt}")[0]
+
+
+async def _resolve_storage_details(local_path: Optional[Union[str, Path]], object_key: Optional[str]):
+    details = {}
+    if object_key and minio_storage and minio_storage.enabled:
+        details["storage"] = "minio"
+        details["object_key"] = object_key
+        url = await minio_storage.get_presigned_url(object_key)
+        if url:
+            details["download_url"] = url
+        stat = await minio_storage.stat_object(object_key)
+        if stat:
+            details["size"] = getattr(stat, "size", None)
+            content_type = getattr(stat, "content_type", None)
+            metadata = getattr(stat, "metadata", None)
+            if not content_type and metadata:
+                content_type = metadata.get("content-type")
+            if content_type:
+                details["content_type"] = content_type
+    elif local_path:
+        path = Path(local_path)
+        details["storage"] = "local"
+        details["local_path"] = str(path)
+        if path.exists():
+            try:
+                details["size"] = path.stat().st_size
+            except OSError:
+                pass
+    else:
+        details["storage"] = "none"
+    return details
+
+
+async def _build_file_entry(
+    *,
+    kind: str,
+    filename: Optional[str],
+    fmt: Optional[str],
+    local_path: Optional[Union[str, Path]],
+    object_key: Optional[str],
+    media_type: Optional[str],
+    language: Optional[str]
+):
+    if not filename and not local_path and not object_key:
+        return None
+    entry = {
+        "type": kind,
+        "format": fmt,
+        "filename": filename,
+        "media_type": media_type,
+        "language": language,
+    }
+    entry.update(await _resolve_storage_details(local_path, object_key))
+    return entry
+
+
+def _present_file_info(entry: Optional[dict]):
+    if not entry:
+        return None
+    return {
+        "filename": entry.get("filename"),
+        "download_url": entry.get("download_url"),
+        "size": entry.get("size"),
+        "format": entry.get("format"),
+        "language": entry.get("language"),
+    }
+
+
+def _build_export_options(
+    export_format: Optional[str],
+    include_timestamps: bool,
+    include_header: bool,
+    *,
+    strict_format: bool,
+    cleanup_export: bool = False,
+):
+    fmt = (export_format or "").strip().lower() or "markdown"
+    if fmt not in EXPORT_FORMATS:
+        if strict_format:
+            raise HTTPException(status_code=400, detail="不支持的导出格式")
+        fmt = "markdown"
+    return {
+        "format": fmt,
+        "include_timestamps": include_timestamps,
+        "include_header": include_header,
+        "cleanup_export": cleanup_export,
+    }
+
+
+async def _start_transcription_job(
+    url: str,
+    summary_language: str,
+    export_format: str,
+    include_timestamps: bool,
+    include_header: bool,
+    cleanup_export: bool,
+):
+    export_options = {
+        "format": export_format,
+        "include_timestamps": include_timestamps,
+        "include_header": include_header,
+        "cleanup_export": cleanup_export,
+    }
+
+    # duplicate handling
+    if url in processing_urls:
+        for tid, task in tasks.items():
+            if task.get("url") == url:
+                return {
+                    "task_id": tid,
+                    "message": "该视频正在处理中，请等待..."
+                }
+
+    task_id = str(uuid.uuid4())
+    processing_urls.add(url)
+
+    tasks[task_id] = {
+        "status": "processing",
+        "progress": 0,
+        "message": "开始处理视频...",
+        "script": None,
+        "summary": None,
+        "error": None,
+        "url": url,
+        "default_export_filename": None,
+        "default_export_format": None,
+        "default_export_include_timestamps": include_timestamps,
+        "default_export_include_header": include_header,
+        "default_export_request_format": export_format,
+    }
+    save_tasks(tasks)
+
+    task = asyncio.create_task(process_video_task(
+        task_id,
+        url,
+        summary_language,
+        export_options
+    ))
+    active_tasks[task_id] = task
+
+    return {"task_id": task_id, "message": "任务已创建，正在处理中..."}
 
 TIMESTAMP_PATTERN = re.compile(
     r"^\s*\**\[\d{2}:\d{2}(?::\d{2})?\s*-\s*\d{2}:\d{2}(?::\d{2})?\]\**\s*$"
@@ -233,70 +476,93 @@ async def read_root():
 
 @app.post("/api/process-video")
 async def process_video(
+    request: Request,
     url: str = Form(...),
     summary_language: str = Form(default="zh"),
     export_format: str = Form(default="markdown"),
     export_include_timestamps: bool = Form(default=False),
     export_include_header: bool = Form(default=False)
 ):
-    """
-    处理视频链接，返回任务ID
-    """
+    """旧版接口：默认允许回退为 Markdown。"""
     try:
-        # 检查是否已经在处理相同的URL
-        if url in processing_urls:
-            # 查找现有任务
-            for tid, task in tasks.items():
-                if task.get("url") == url:
-                    return {"task_id": tid, "message": "该视频正在处理中，请等待..."}
-            
-        # 生成唯一任务ID
-        task_id = str(uuid.uuid4())
-        
-        # 标记URL为正在处理
-        processing_urls.add(url)
-        
-        # 初始化任务状态
-        tasks[task_id] = {
-            "status": "processing",
-            "progress": 0,
-            "message": "开始处理视频...",
-            "script": None,
-            "summary": None,
-            "error": None,
-            "url": url,  # 保存URL用于去重
-            "default_export_filename": None,
-            "default_export_format": None,
-            "default_export_include_timestamps": export_include_timestamps,
-            "default_export_include_header": export_include_header,
-            "default_export_request_format": export_format
-        }
-        save_tasks(tasks)
-        
-        # 创建并跟踪异步任务
-        task = asyncio.create_task(process_video_task(
-            task_id,
+        try:
+            form_dump = dict(await request.form())
+            logger.info("[API] /process-video payload=%s", form_dump)
+        except Exception as exc:
+            logger.warning("[API] 读取表单失败: %s", exc)
+
+        export_opts = _build_export_options(
+            export_format,
+            export_include_timestamps,
+            export_include_header,
+            strict_format=False,
+            cleanup_export=False,
+        )
+        return await _start_transcription_job(
             url,
             summary_language,
-            {
-                "format": export_format.lower(),
-                "include_timestamps": export_include_timestamps,
-                "include_header": export_include_header
-            }
-        ))
-        active_tasks[task_id] = task
-        
-        return {"task_id": task_id, "message": "任务已创建，正在处理中..."}
-        
+            export_opts["format"],
+            export_opts["include_timestamps"],
+            export_opts["include_header"],
+            export_opts["cleanup_export"],
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"处理视频时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
+
+
+@app.post("/api/video/transcribe")
+async def process_video_v2(
+    request: Request,
+    url: str = Form(...),
+    summary_language: str = Form(...),
+    export_format: str = Form(...),
+    export_include_timestamps: bool = Form(default=False),
+    export_include_header: bool = Form(default=False),
+):
+    """新版接口：严格按照 export_format 生成并上传后清理本地导出文件。"""
+    try:
+        try:
+            form_dump = dict(await request.form())
+            logger.info("[API] /video/transcribe payload=%s", form_dump)
+        except Exception as exc:
+            logger.warning("[API] /video/transcribe 读取表单失败: %s", exc)
+
+        export_opts = _build_export_options(
+            export_format,
+            export_include_timestamps,
+            export_include_header,
+            strict_format=True,
+            cleanup_export=True,
+        )
+        return await _start_transcription_job(
+            url,
+            summary_language,
+            export_opts["format"],
+            export_opts["include_timestamps"],
+            export_opts["include_header"],
+            export_opts["cleanup_export"],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/api/video/transcribe 处理出错: {str(e)}")
         raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
 
 async def process_video_task(task_id: str, url: str, summary_language: str, export_options: dict):
     """
     异步处理视频任务
     """
+    audio_temp_path: Optional[Path] = None
     try:
+        raw_object_key = None
+        translation_object_key = None
+        transcript_object_key = None
+        summary_object_key = None
+        default_export_object_key = None
+
         # 立即更新状态：开始下载视频
         tasks[task_id].update({
             "status": "processing",
@@ -320,6 +586,7 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
         
         # 下载并转换视频
         audio_path, video_title = await video_processor.download_and_convert(url, TEMP_DIR)
+        audio_temp_path = Path(audio_path)
         
         # 下载完成，更新状态
         tasks[task_id].update({
@@ -351,9 +618,11 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
                 f.write(content_raw)
 
             # 记录原始转录文件路径（仅保存文件名，实际路径位于TEMP_DIR）
-            tasks[task_id].update({
-                "raw_script_file": raw_md_filename
-            })
+            raw_update = {
+                "raw_script_file": raw_md_filename,
+                "raw_script_content": content_raw
+            }
+            tasks[task_id].update(raw_update)
             save_tasks(tasks)
             await broadcast_task_update(task_id, tasks[task_id])
         except Exception as e:
@@ -380,6 +649,7 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
         translation_content = None
         translation_filename = None
         translation_path = None
+        translation_path_str = None
         
         if detected_language and translator.should_translate(detected_language, summary_language):
             logger.info(f"需要翻译: {detected_language} -> {summary_language}")
@@ -400,6 +670,7 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
             translation_path = TEMP_DIR / translation_filename
             async with aiofiles.open(translation_path, "w", encoding="utf-8") as f:
                 await f.write(translation_with_title)
+            translation_path_str = str(translation_path)
         else:
             logger.info(f"不需要翻译: detected_language={detected_language}, summary_language={summary_language}, should_translate={translator.should_translate(detected_language, summary_language) if detected_language else 'N/A'}")
         
@@ -432,11 +703,15 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
             # 如重命名失败，继续使用原路径
             pass
 
+        script_path_str = str(script_path)
+
         # 保存摘要到文件（summary_标题_短ID.md）
         summary_filename = f"summary_{safe_title}_{short_id}.md"
         summary_path = TEMP_DIR / summary_filename
         async with aiofiles.open(summary_path, "w", encoding="utf-8") as f:
             await f.write(summary_with_source)
+
+        summary_path_str = str(summary_path)
         
         # 更新状态：完成
         default_export_filename = None
@@ -461,6 +736,16 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
                         f.write(buffer.getvalue())
                     default_export_filename = filename
                     default_export_format = fmt_key
+                    default_export_object_key = await _upload_to_minio(
+                        full_path,
+                        _compose_object_name("exports", filename, task_id=task_id),
+                        required=True
+                    )
+                    if default_export_object_key:
+                        if export_options.get("cleanup_export"):
+                            _delete_local_file(full_path, force=True)
+                        else:
+                            _delete_local_file(full_path)
                 except Exception as e:
                     logger.error(f"默认导出文件生成失败: {e}")
 
@@ -471,14 +756,18 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
             "video_title": video_title,
             "script": script_with_title,
             "summary": summary_with_source,
-            "script_path": str(script_path),
-            "summary_path": str(summary_path),
+            "script_path": script_path_str,
+            "summary_path": summary_path_str,
+            "raw_script_object": raw_object_key,
+            "transcript_object": transcript_object_key,
+            "summary_object": summary_object_key,
             "short_id": short_id,
             "safe_title": safe_title,
             "detected_language": detected_language,
             "summary_language": summary_language,
             "default_export_filename": default_export_filename,
             "default_export_format": default_export_format,
+            "default_export_object": default_export_object_key,
             "default_export_include_timestamps": export_options.get("include_timestamps", False) if export_options else False,
             "default_export_include_header": export_options.get("include_header", False) if export_options else False
         }
@@ -487,8 +776,9 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
         if translation_content and translation_path:
             task_result.update({
                 "translation": translation_with_title,
-                "translation_path": str(translation_path),
-                "translation_filename": translation_filename
+                "translation_path": translation_path_str,
+                "translation_filename": translation_filename,
+                "translation_object": translation_object_key
             })
         
         tasks[task_id].update(task_result)
@@ -523,6 +813,9 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
         })
         save_tasks(tasks)
         await broadcast_task_update(task_id, tasks[task_id])
+    finally:
+        if audio_temp_path:
+            _delete_local_file(audio_temp_path)
 
 @app.get("/api/task-status/{task_id}")
 async def get_task_status(task_id: str):
@@ -533,6 +826,124 @@ async def get_task_status(task_id: str):
         raise HTTPException(status_code=404, detail="任务不存在")
     
     return tasks[task_id]
+
+
+async def _collect_task_files(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    task_data = tasks[task_id]
+    files = []
+    detected_language = task_data.get("detected_language")
+
+    default_filename = task_data.get("default_export_filename")
+    default_fmt = task_data.get("default_export_format")
+    default_object = task_data.get("default_export_object")
+
+    if default_filename or default_object:
+        entry = await _build_file_entry(
+            kind="default_export",
+            filename=default_filename,
+            fmt=default_fmt or _format_from_filename(default_filename),
+            local_path=(TEMP_DIR / default_filename) if default_filename else None,
+            object_key=default_object,
+            media_type=_media_type_for_format(default_fmt),
+            language=detected_language
+        )
+        if entry:
+            files.append(entry)
+
+    return task_data, files
+
+
+async def _build_stream_payload(task_id: str, task_snapshot: dict):
+    payload = dict(task_snapshot or {})
+    for field in (
+        "raw_script_object",
+        "transcript_object",
+        "summary_object",
+        "translation_object",
+        "default_export_object",
+        "script",
+        "summary",
+        "translation",
+        "raw_script_file",
+        "raw_script_content",
+        "translation_path",
+        "summary_path",
+        "script_path",
+        "translation_filename",
+    ):
+        payload.pop(field, None)
+    if payload.get("status") == "completed":
+        try:
+            _, files = await _collect_task_files(task_id)
+            payload["files"] = [info for info in (_present_file_info(f) for f in files) if info]
+        except HTTPException:
+            payload["files"] = []
+    else:
+        payload.pop("files", None)
+    return payload
+
+
+@app.get("/api/video/transcribe/process")
+async def get_video_transcribe(task_id: str = Query(..., description="任务ID")):
+    """查询指定任务的文件列表及元信息。"""
+    task_data, files = await _collect_task_files(task_id)
+    file_payload = []
+    if task_data.get("status") == "completed":
+        file_payload = [info for info in (_present_file_info(f) for f in files) if info]
+    return {
+        "task_id": task_id,
+        "status": task_data.get("status"),
+        "video_title": task_data.get("video_title"),
+        "files": file_payload
+    }
+
+
+@app.get("/api/video/transcribe/process/stream/{task_id}")
+async def video_transcribe_stream(task_id: str):
+    """返回任务流式状态，完成标志为成功上传至MinIO。"""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    async def event_generator():
+        queue = asyncio.Queue()
+        if task_id not in sse_connections:
+            sse_connections[task_id] = []
+        sse_connections[task_id].append(queue)
+
+        try:
+            initial_payload = await _build_stream_payload(task_id, tasks.get(task_id, {}))
+            yield f"data: {json.dumps(initial_payload, ensure_ascii=False)}\n\n"
+
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    task_data = json.loads(data)
+                    payload = await _build_stream_payload(task_id, task_data)
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    if payload.get("status") in ["completed", "error"]:
+                        break
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
+        finally:
+            if task_id in sse_connections and queue in sse_connections[task_id]:
+                sse_connections[task_id].remove(queue)
+                if not sse_connections[task_id]:
+                    del sse_connections[task_id]
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET",
+            "Access-Control-Allow-Headers": "Cache-Control"
+        }
+    )
 
 @app.get("/api/task-stream/{task_id}")
 async def task_stream(task_id: str):
@@ -637,6 +1048,8 @@ async def export_content(
             if raw_filename:
                 raw_path = TEMP_DIR / raw_filename
                 content = _load_text_from_file(raw_path)
+            if not content:
+                content = task_data.get("raw_script_content")
         if not content:
             script_path = task_data.get("script_path")
             if script_path:

@@ -8,6 +8,19 @@ import sys
 import subprocess
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional runtime dependency
+    load_dotenv = None
+
+
+def load_env_file():
+    if load_dotenv:
+        env_path = Path(__file__).resolve().parent / ".env"
+        load_dotenv(dotenv_path=env_path, override=False)
+    else:
+        print("⚠️  未安装python-dotenv，.env文件不会自动加载")
+
 def check_dependencies():
     """检查依赖是否安装"""
     import sys
@@ -16,7 +29,8 @@ def check_dependencies():
         "uvicorn": "uvicorn", 
         "yt-dlp": "yt_dlp",
         "faster-whisper": "faster_whisper",
-        "openai": "openai"
+        "openai": "openai",
+        "python-dotenv": "dotenv"
     }
     
     missing_packages = []
@@ -77,6 +91,7 @@ def setup_environment():
 
 def main():
     """主函数"""
+    load_env_file()
     # 检查是否使用生产模式（禁用热重载）
     production_mode = "--prod" in sys.argv or os.getenv("PRODUCTION_MODE") == "true"
     
