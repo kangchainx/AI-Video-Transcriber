@@ -72,6 +72,10 @@ TEMP_DIR = PROJECT_ROOT / "temp"
 TEMP_DIR.mkdir(exist_ok=True)
 
 CLEAN_TEMP_FILES = os.getenv("CLEAN_TEMP_FILES", "false").lower() == "true"
+if CLEAN_TEMP_FILES:
+    logger.info("[Temp] CLEAN_TEMP_FILES=true，任务完成后将删除缓存文件")
+else:
+    logger.info("[Temp] CLEAN_TEMP_FILES=false，任务完成后保留缓存文件")
 
 # 初始化处理器
 video_processor = VideoProcessor()
@@ -197,6 +201,20 @@ def _delete_local_file(path: Optional[Union[Path, str]], *, force: bool = False)
             logger.info(f"已删除本地缓存文件: {target}")
     except Exception as exc:
         logger.warning(f"删除本地文件失败 {path}: {exc}")
+
+
+def _cleanup_temp_artifacts(task_data: dict):
+    if not CLEAN_TEMP_FILES:
+        return
+    for key in ("raw_script_file", "script_path", "summary_path", "translation_path"):
+        path_value = task_data.get(key)
+        if not path_value:
+            continue
+        if key == "raw_script_file" and not Path(path_value).is_absolute():
+            target = TEMP_DIR / path_value
+        else:
+            target = path_value
+        _delete_local_file(target, force=True)
 
 def _load_text_from_file(path: Path) -> Optional[str]:
     """读取UTF-8文本文件，若失败返回None。"""
@@ -786,6 +804,9 @@ async def process_video_task(task_id: str, url: str, summary_language: str, expo
         logger.info(f"任务完成，准备广播最终状态: {task_id}")
         await broadcast_task_update(task_id, tasks[task_id])
         logger.info(f"最终状态已广播: {task_id}")
+
+        if CLEAN_TEMP_FILES:
+            _cleanup_temp_artifacts(tasks[task_id])
         
         # 从处理列表中移除URL
         processing_urls.discard(url)
