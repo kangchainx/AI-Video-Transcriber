@@ -12,6 +12,7 @@ env/
 .venv/
 venv/
 ENV/
+.env
 
 # 临时文件
 temp/
